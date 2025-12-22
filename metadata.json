@@ -1,0 +1,5 @@
+{
+  "name": "ArchaeoGraph - 考古系络图生成器",
+  "description": "专业的田野考古系络图（Harris Matrix）生成工具。支持遗迹层位关系录入、AI智能识别田野记录、以及符合考古规程的自动绘图功能。",
+  "requestFramePermissions": []
+}
