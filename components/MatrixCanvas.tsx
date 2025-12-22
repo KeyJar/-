@@ -34,42 +34,80 @@ interface Segment {
 }
 
 /**
- * 核心算法：生成带“过桥”的直角路径
+ * 核心算法：生成带“过桥”且水平分流的直角路径
  */
 const generateOrthogonalPathsWithBridges = (links: GraphLink[], nodeHeight = 30) => {
-  const basicPaths = links.map((link, index) => {
+  // 1. 预计算所有连线的基础信息
+  const linkInfos = links.map((link, index) => {
     const sx = link.source.x;
-    const sy = link.source.y + (link.source.type === 'LAYER' ? 18 : 14); // Bottom of node
+    const sy = link.source.y + (link.source.type === 'LAYER' ? 18 : 14);
     const tx = link.target.x;
-    const ty = link.target.y - (link.target.type === 'LAYER' ? 18 : 14); // Top of node
-    
-    // 如果X相同，直接垂直下落
-    if (Math.abs(sx - tx) < 1) {
+    const ty = link.target.y - (link.target.type === 'LAYER' ? 18 : 14);
+    const isVertical = Math.abs(sx - tx) < 1;
+    const midY = (sy + ty) / 2;
+    return { index, sx, sy, tx, ty, midY, isVertical };
+  });
+
+  // 2. 分组水平线段，解决重叠
+  // key: 近似的 midY, value: link indices
+  const gapGroups = new Map<number, number[]>();
+  linkInfos.forEach(info => {
+      if (!info.isVertical) {
+          const key = Math.floor(info.midY / 10) * 10;
+          if (!gapGroups.has(key)) gapGroups.set(key, []);
+          gapGroups.get(key)!.push(info.index);
+      }
+  });
+
+  const yOffsets = new Map<number, number>();
+  gapGroups.forEach((indices) => {
+      if (indices.length <= 1) return;
+      // 排序策略：使用简单的中心位置排序，让线更顺畅
+      indices.sort((a, b) => {
+          const infoA = linkInfos[a];
+          const infoB = linkInfos[b];
+          const centerA = (infoA.sx + infoA.tx) / 2;
+          const centerB = (infoB.sx + infoB.tx) / 2;
+          return centerA - centerB;
+      });
+
+      const spacing = 6; // 通道间距
+      const startOffset = -((indices.length - 1) * spacing) / 2;
+      indices.forEach((idx, i) => {
+          yOffsets.set(idx, startOffset + i * spacing);
+      });
+  });
+
+  // 3. 生成路径点
+  const basicPaths = linkInfos.map(info => {
+    if (info.isVertical) {
         return {
-            id: index,
-            points: [{x: sx, y: sy}, {x: tx, y: ty}],
-            segments: [{p1: {x: sx, y: sy}, p2: {x: tx, y: ty}, isHorizontal: false, linkId: index.toString()}]
+            id: info.index,
+            points: [{x: info.sx, y: info.sy}, {x: info.tx, y: info.ty}],
+            segments: [{p1: {x: info.sx, y: info.sy}, p2: {x: info.tx, y: info.ty}, isHorizontal: false, linkId: info.index.toString()}]
         };
     }
 
-    const midY = (sy + ty) / 2;
-    // Orthogonal: (sx, sy) -> (sx, midY) -> (tx, midY) -> (tx, ty)
-    const p1 = { x: sx, y: sy };
-    const p2 = { x: sx, y: midY };
-    const p3 = { x: tx, y: midY };
-    const p4 = { x: tx, y: ty };
+    const offset = yOffsets.get(info.index) || 0;
+    const actualMidY = info.midY + offset;
+
+    const p1 = { x: info.sx, y: info.sy };
+    const p2 = { x: info.sx, y: actualMidY };
+    const p3 = { x: info.tx, y: actualMidY };
+    const p4 = { x: info.tx, y: info.ty };
 
     return {
-        id: index,
+        id: info.index,
         points: [p1, p2, p3, p4],
         segments: [
-            { p1, p2, isHorizontal: false, linkId: index.toString() }, // Vertical 1
-            { p1: p2, p2: p3, isHorizontal: true, linkId: index.toString() },  // Horizontal
-            { p1: p3, p2: p4, isHorizontal: false, linkId: index.toString() }  // Vertical 2
+            { p1, p2, isHorizontal: false, linkId: info.index.toString() },
+            { p1: p2, p2: p3, isHorizontal: true, linkId: info.index.toString() },
+            { p1: p3, p2: p4, isHorizontal: false, linkId: info.index.toString() }
         ]
     };
   });
 
+  // 4. 计算过桥
   const allVerticalSegments: Segment[] = [];
   basicPaths.forEach(path => {
       path.segments.forEach(seg => {
@@ -77,7 +115,7 @@ const generateOrthogonalPathsWithBridges = (links: GraphLink[], nodeHeight = 30)
       });
   });
 
-  const finalPathStrings = basicPaths.map(path => {
+  return basicPaths.map(path => {
       if (path.points.length === 2) {
           return `M ${path.points[0].x} ${path.points[0].y} L ${path.points[1].x} ${path.points[1].y}`;
       }
@@ -97,6 +135,7 @@ const generateOrthogonalPathsWithBridges = (links: GraphLink[], nodeHeight = 30)
           const vyMin = Math.min(vSeg.p1.y, vSeg.p2.y);
           const vyMax = Math.max(vSeg.p1.y, vSeg.p2.y);
 
+          // 简单的相交检测
           if (vx > minX + 2 && vx < maxX - 2 && yLevel > vyMin + 2 && yLevel < vyMax - 2) {
               intersections.push(vx);
           }
@@ -110,9 +149,11 @@ const generateOrthogonalPathsWithBridges = (links: GraphLink[], nodeHeight = 30)
       const bridgeRadius = 4;
 
       intersections.forEach(ix => {
+          // 绘制到桥前
           const bridgeStart = ix - (direction * bridgeRadius);
           d += ` L ${bridgeStart} ${yLevel}`;
           
+          // 绘制桥
           const bridgeEnd = ix + (direction * bridgeRadius);
           d += ` A ${bridgeRadius} ${bridgeRadius} 0 0 1 ${bridgeEnd} ${yLevel}`;
           
@@ -124,8 +165,6 @@ const generateOrthogonalPathsWithBridges = (links: GraphLink[], nodeHeight = 30)
 
       return d;
   });
-
-  return finalPathStrings;
 };
 
 const MatrixCanvas: React.FC<MatrixCanvasProps> = ({ units, relations, onNodeClick }) => {
