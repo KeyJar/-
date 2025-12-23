@@ -1,3 +1,4 @@
+
 export enum RelationType {
   CUTS = 'CUTS', // 打破 (晚打破早)
   OVERLAYS = 'OVERLAYS', // 叠压 (晚叠压早)
@@ -40,6 +41,8 @@ export interface GraphLink {
   source: GraphNode;
   target: GraphNode;
   type: RelationType;
+  d?: string; // SVG Path Data
+  id?: string;
 }
 
 export interface ParsedFieldNote {

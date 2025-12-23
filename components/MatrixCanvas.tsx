@@ -1,16 +1,22 @@
-import React, { useEffect, useRef, useMemo } from 'react';
+import React, { useEffect, useRef, useMemo, useState } from 'react';
 import * as d3 from 'd3';
-import { ArchaeologicalUnit, StratigraphicRelation, GraphNode, GraphLink } from '../types';
-import { calculateLayout } from '../utils/graphLayout';
-import { Download } from 'lucide-react';
+import { ArchaeologicalUnit, StratigraphicRelation, GraphNode, GraphLink, RelationType, UnitType } from '../types';
+import { calculateLayout, calculateRoutes, LinkPortConfig, Side, RouteType } from '../utils/graphLayout';
+import { Download, Move, MousePointer2, Plus, PenTool, Eraser, Square, Lock, Unlock, ZoomIn, ZoomOut, Maximize, Circle } from 'lucide-react';
 
 interface MatrixCanvasProps {
   units: ArchaeologicalUnit[];
   relations: StratigraphicRelation[];
   onNodeClick: (unit: ArchaeologicalUnit) => void;
+  onAddRelation?: (relation: StratigraphicRelation) => void;
+  onAddUnit?: (unit: ArchaeologicalUnit) => void;
+  onDeleteUnit?: (id: string) => void;
+  onDeleteRelation?: (id: string) => void;
 }
 
-// 转换逻辑：1 -> ①, 2a -> ②a
+// Tool types
+type ToolType = 'select' | 'node' | 'edge' | 'eraser';
+
 const toCircled = (str: string): string => {
   const match = str.match(/^(\d+)([a-z]*)$/);
   if (match) {
@@ -25,262 +31,510 @@ const toCircled = (str: string): string => {
   return str;
 };
 
-// 定义线段
-interface Segment {
-  p1: { x: number; y: number };
-  p2: { x: number; y: number };
-  isHorizontal: boolean;
-  linkId?: string; // 所属连线的标识
-}
-
-/**
- * 核心算法：生成带“过桥”且水平分流的直角路径
- */
-const generateOrthogonalPathsWithBridges = (links: GraphLink[], nodeHeight = 30) => {
-  // 1. 预计算所有连线的基础信息
-  const linkInfos = links.map((link, index) => {
-    const sx = link.source.x;
-    const sy = link.source.y + (link.source.type === 'LAYER' ? 18 : 14);
-    const tx = link.target.x;
-    const ty = link.target.y - (link.target.type === 'LAYER' ? 18 : 14);
-    const isVertical = Math.abs(sx - tx) < 1;
-    const midY = (sy + ty) / 2;
-    return { index, sx, sy, tx, ty, midY, isVertical };
-  });
-
-  // 2. 分组水平线段，解决重叠
-  // key: 近似的 midY, value: link indices
-  const gapGroups = new Map<number, number[]>();
-  linkInfos.forEach(info => {
-      if (!info.isVertical) {
-          const key = Math.floor(info.midY / 10) * 10;
-          if (!gapGroups.has(key)) gapGroups.set(key, []);
-          gapGroups.get(key)!.push(info.index);
-      }
-  });
-
-  const yOffsets = new Map<number, number>();
-  gapGroups.forEach((indices) => {
-      if (indices.length <= 1) return;
-      // 排序策略：使用简单的中心位置排序，让线更顺畅
-      indices.sort((a, b) => {
-          const infoA = linkInfos[a];
-          const infoB = linkInfos[b];
-          const centerA = (infoA.sx + infoA.tx) / 2;
-          const centerB = (infoB.sx + infoB.tx) / 2;
-          return centerA - centerB;
-      });
-
-      const spacing = 6; // 通道间距
-      const startOffset = -((indices.length - 1) * spacing) / 2;
-      indices.forEach((idx, i) => {
-          yOffsets.set(idx, startOffset + i * spacing);
-      });
-  });
-
-  // 3. 生成路径点
-  const basicPaths = linkInfos.map(info => {
-    if (info.isVertical) {
-        return {
-            id: info.index,
-            points: [{x: info.sx, y: info.sy}, {x: info.tx, y: info.ty}],
-            segments: [{p1: {x: info.sx, y: info.sy}, p2: {x: info.tx, y: info.ty}, isHorizontal: false, linkId: info.index.toString()}]
-        };
-    }
-
-    const offset = yOffsets.get(info.index) || 0;
-    const actualMidY = info.midY + offset;
-
-    const p1 = { x: info.sx, y: info.sy };
-    const p2 = { x: info.sx, y: actualMidY };
-    const p3 = { x: info.tx, y: actualMidY };
-    const p4 = { x: info.tx, y: info.ty };
-
-    return {
-        id: info.index,
-        points: [p1, p2, p3, p4],
-        segments: [
-            { p1, p2, isHorizontal: false, linkId: info.index.toString() },
-            { p1: p2, p2: p3, isHorizontal: true, linkId: info.index.toString() },
-            { p1: p3, p2: p4, isHorizontal: false, linkId: info.index.toString() }
-        ]
-    };
-  });
-
-  // 4. 计算过桥
-  const allVerticalSegments: Segment[] = [];
-  basicPaths.forEach(path => {
-      path.segments.forEach(seg => {
-          if (!seg.isHorizontal) allVerticalSegments.push(seg);
-      });
-  });
-
-  return basicPaths.map(path => {
-      if (path.points.length === 2) {
-          return `M ${path.points[0].x} ${path.points[0].y} L ${path.points[1].x} ${path.points[1].y}`;
-      }
-
-      const [v1, h, v2] = path.segments;
-      const yLevel = h.p1.y;
-      const minX = Math.min(h.p1.x, h.p2.x);
-      const maxX = Math.max(h.p1.x, h.p2.x);
-      const direction = h.p2.x > h.p1.x ? 1 : -1; 
-
-      const intersections: number[] = []; 
-
-      allVerticalSegments.forEach(vSeg => {
-          if (vSeg.linkId === path.id.toString()) return; 
-          
-          const vx = vSeg.p1.x;
-          const vyMin = Math.min(vSeg.p1.y, vSeg.p2.y);
-          const vyMax = Math.max(vSeg.p1.y, vSeg.p2.y);
-
-          // 简单的相交检测
-          if (vx > minX + 2 && vx < maxX - 2 && yLevel > vyMin + 2 && yLevel < vyMax - 2) {
-              intersections.push(vx);
-          }
-      });
-
-      intersections.sort((a, b) => direction === 1 ? a - b : b - a);
-
-      let d = `M ${path.points[0].x} ${path.points[0].y} L ${h.p1.x} ${h.p1.y}`; 
-      
-      let currentX = h.p1.x;
-      const bridgeRadius = 4;
-
-      intersections.forEach(ix => {
-          // 绘制到桥前
-          const bridgeStart = ix - (direction * bridgeRadius);
-          d += ` L ${bridgeStart} ${yLevel}`;
-          
-          // 绘制桥
-          const bridgeEnd = ix + (direction * bridgeRadius);
-          d += ` A ${bridgeRadius} ${bridgeRadius} 0 0 1 ${bridgeEnd} ${yLevel}`;
-          
-          currentX = bridgeEnd;
-      });
-
-      d += ` L ${h.p2.x} ${h.p2.y}`; 
-      d += ` L ${path.points[3].x} ${path.points[3].y}`; 
-
-      return d;
-  });
-};
-
-const MatrixCanvas: React.FC<MatrixCanvasProps> = ({ units, relations, onNodeClick }) => {
+const MatrixCanvas: React.FC<MatrixCanvasProps> = ({ 
+    units, relations, onNodeClick, onAddRelation, onAddUnit, onDeleteUnit, onDeleteRelation 
+}) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
 
-  const { nodes, links, layers } = useMemo(() => {
+  // --- Layout State ---
+  const [layoutMode, setLayoutMode] = useState<'auto' | 'manual'>('auto');
+  const [manualPositions, setManualPositions] = useState<Map<string, {x:number, y:number}>>(new Map());
+  const [linkSegmentOffsets, setLinkSegmentOffsets] = useState<Map<string, number>>(new Map());
+  const [linkPorts, setLinkPorts] = useState<Map<string, LinkPortConfig>>(new Map()); 
+  
+  // --- Tool State ---
+  const [activeTool, setActiveTool] = useState<ToolType>('select');
+  const [drawSourceId, setDrawSourceId] = useState<string | null>(null);
+  const [mousePos, setMousePos] = useState<{x:number, y:number} | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  
+  // 1. Calculate Initial/Auto Layout
+  const autoLayout = useMemo(() => {
     return calculateLayout(units, relations, 1000, 800);
   }, [units, relations]);
 
-  const pathStrings = useMemo(() => {
-      return generateOrthogonalPathsWithBridges(links);
-  }, [links]);
+  // 2. Merge Manual Positions (Fully Editable Graph)
+  const { nodes, links, layers } = useMemo(() => {
+    // Determine the base positions
+    const baseNodes = autoLayout.nodes;
+    
+    const mergedNodes = baseNodes.map(n => {
+        const manual = manualPositions.get(n.id);
+        if (manual) {
+            return { ...n, x: manual.x, y: manual.y };
+        }
+        return { ...n };
+    });
 
+    const nodeMap = new Map(mergedNodes.map(n => [n.id, n]));
+    const mergedLinks = autoLayout.links.map(l => {
+        const src = nodeMap.get(l.source.id);
+        const tgt = nodeMap.get(l.target.id);
+        if (!src || !tgt) return null;
+        return { ...l, source: src, target: tgt };
+    }).filter(l => l !== null) as GraphLink[];
+
+    return { nodes: mergedNodes, links: mergedLinks, layers: autoLayout.layers };
+  }, [autoLayout, manualPositions]);
+
+  // 3. Generate Paths (With Custom Ports)
+  const routes = useMemo(() => {
+      return calculateRoutes(nodes, links, linkSegmentOffsets, linkPorts);
+  }, [nodes, links, linkSegmentOffsets, linkPorts]);
+
+  // --- Handlers ---
+
+  const switchToManual = () => {
+      if (layoutMode === 'auto') {
+          // Snapshot current positions to allow editing from here
+          const initMap = new Map<string, {x:number, y:number}>();
+          nodes.forEach(n => initMap.set(n.id, {x: n.x, y: n.y}));
+          setManualPositions(initMap);
+          setLayoutMode('manual');
+      }
+  };
+
+  const handleToolChange = (tool: ToolType) => {
+      if (tool !== 'select') {
+          switchToManual();
+      }
+      setActiveTool(tool);
+      setDrawSourceId(null);
+      setSelectedId(null);
+  };
+
+  const updateLinkPort = (linkId: string, type: 'source' | 'target', side: Side) => {
+      switchToManual();
+      setLinkPorts(prev => {
+          const next = new Map(prev);
+          const oldConfig = next.get(linkId);
+          // Use safe spread for potentially undefined config
+          const current: LinkPortConfig = oldConfig ? { ...oldConfig } : {};
+          
+          if (type === 'source') current.sourceSide = side;
+          else current.targetSide = side;
+          
+          next.set(linkId, current);
+          return next;
+      });
+  };
+
+  // Zoom Controls
+  const handleZoomIn = () => {
+      if (svgRef.current && zoomBehaviorRef.current) {
+          d3.select(svgRef.current).transition().duration(300).call(zoomBehaviorRef.current.scaleBy, 1.2);
+      }
+  };
+
+  const handleZoomOut = () => {
+      if (svgRef.current && zoomBehaviorRef.current) {
+          d3.select(svgRef.current).transition().duration(300).call(zoomBehaviorRef.current.scaleBy, 0.8);
+      }
+  };
+
+  const handleResetZoom = () => {
+      if (svgRef.current && zoomBehaviorRef.current && containerRef.current) {
+          const width = containerRef.current.clientWidth;
+          d3.select(svgRef.current).transition().duration(500)
+            .call(zoomBehaviorRef.current.transform, d3.zoomIdentity.translate(width/2 - 500, 50).scale(0.8));
+      }
+  };
+
+  // Keyboard Shortcuts
+  useEffect(() => {
+      const handleKeyDown = (e: KeyboardEvent) => {
+          if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+          if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
+             const unit = units.find(u => u.id === selectedId);
+             if (unit && onDeleteUnit) {
+                 if (confirm(`确定要删除 ${selectedId} 吗?`)) {
+                    onDeleteUnit(selectedId);
+                    setSelectedId(null);
+                 }
+                 return;
+             }
+             const rel = relations.find(r => r.id === selectedId);
+             if (rel && onDeleteRelation) {
+                 if (confirm('确定要删除这条连线吗?')) {
+                    onDeleteRelation(selectedId);
+                    setSelectedId(null);
+                 }
+                 return;
+             }
+          }
+
+          if (e.key === 'v' || e.key === 'V') handleToolChange('select');
+          if (e.key === 'b' || e.key === 'B') handleToolChange('node');
+          if (e.key === 'l' || e.key === 'L') handleToolChange('edge');
+          if (e.key === 'd' || e.key === 'D') handleToolChange('eraser');
+      };
+
+      window.addEventListener('keydown', handleKeyDown);
+      return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedId, units, relations, onDeleteUnit, onDeleteRelation]);
+
+  // Canvas Interactions
+  const handleCanvasClick = (e: React.MouseEvent) => {
+      if (!svgRef.current) return;
+      if (e.button === 1) return; // Middle click ignore
+
+      if (activeTool === 'select') {
+          // If clicking port controls, don't deselect
+          if ((e.target as Element).closest('.port-control')) return;
+
+          if (e.target === svgRef.current) {
+              setSelectedId(null);
+          }
+      }
+
+      if (activeTool === 'node' && onAddUnit) {
+          const svg = d3.select(svgRef.current);
+          const g = svg.select<SVGGElement>("g.main-group");
+          const [mx, my] = d3.pointer(e, g.node());
+
+          let counter = 1;
+          let newId = `H${counter}`;
+          while (units.some(u => u.id === newId)) {
+              counter++;
+              newId = `H${counter}`;
+          }
+
+          setManualPositions(prev => {
+              const next = new Map(prev);
+              next.set(newId, { x: mx, y: my });
+              return next;
+          });
+
+          onAddUnit({ id: newId, type: UnitType.ASH_PIT, description: '新遗迹' });
+          setSelectedId(newId);
+      }
+  };
+
+  const handleNodeInteraction = (unit: ArchaeologicalUnit, event: any) => {
+      if (activeTool === 'eraser') {
+          if (onDeleteUnit && confirm(`确定要删除 ${unit.id} 吗?`)) onDeleteUnit(unit.id);
+          return;
+      }
+
+      if (activeTool === 'edge') {
+          if (!onAddRelation) return;
+          if (!drawSourceId) {
+              setDrawSourceId(unit.id);
+          } else {
+              if (drawSourceId !== unit.id) {
+                  const exists = relations.some(r => r.sourceId === drawSourceId && r.targetId === unit.id);
+                  if (!exists) {
+                      onAddRelation({
+                          id: `${drawSourceId}-CUTS-${unit.id}-${Date.now()}`,
+                          sourceId: drawSourceId,
+                          targetId: unit.id,
+                          type: RelationType.CUTS
+                      });
+                  }
+              }
+              setDrawSourceId(null);
+          }
+          return;
+      }
+
+      if (activeTool === 'select') {
+          if (event.detail === 2) onNodeClick(unit); 
+          else setSelectedId(unit.id);
+      }
+  };
+
+  const handleLinkClick = (linkId: string) => {
+      if (activeTool === 'eraser' && onDeleteRelation) {
+          if (confirm('确定要删除这条连线吗?')) onDeleteRelation(linkId);
+      } else if (activeTool === 'select') {
+          setSelectedId(linkId);
+      }
+  };
+
+  // --- D3 Render ---
+
+  // Zoom
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) return;
-
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove(); 
-
     const width = containerRef.current.clientWidth;
-    const height = Math.max(600, layers * 150 + 200);
 
-    const g = svg.append("g");
+    let g = svg.select<SVGGElement>("g.main-group");
+    if (g.empty()) {
+        g = svg.append("g").attr("class", "main-group");
+    }
+
     const zoom = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.1, 4])
-      .on("zoom", (event) => {
-        g.attr("transform", event.transform);
-      });
+        .scaleExtent([0.1, 4])
+        .filter((event) => event.type === 'wheel' || event.button === 1)
+        .on("zoom", (event) => {
+            g.attr("transform", event.transform);
+        });
     
-    svg.call(zoom)
-       .attr("viewBox", [0, 0, width, height])
-       .attr("width", width)
-       .attr("height", height);
+    zoomBehaviorRef.current = zoom;
+    svg.call(zoom);
 
-    const defs = svg.append("defs");
-    defs.append("marker")
-      .attr("id", "arrow-filled")
-      .attr("viewBox", "0 -5 10 10")
-      .attr("refX", 10) // Tip at end of path (touching node)
-      .attr("refY", 0)
-      .attr("markerWidth", 7)
-      .attr("markerHeight", 7)
-      .attr("orient", "auto")
-      .append("path")
-      .attr("d", "M0,-5L10,0L0,5")
-      .attr("fill", "#000");
+    if (!svg.attr("data-initialized")) {
+        svg.call(zoom.transform, d3.zoomIdentity.translate(width/2 - 500, 50).scale(0.8));
+        svg.attr("data-initialized", "true");
+    }
+    
+    svg.on("mousedown", (event) => { if (event.button === 1) event.preventDefault(); });
+  }, []); 
+
+  // Node Drag
+  useEffect(() => {
+      if (!svgRef.current) return;
+      const svg = d3.select(svgRef.current);
+      
+      const dragBehavior = d3.drag<SVGGElement, GraphNode>()
+        .filter(event => event.button === 0) 
+        .on("start", (event, d) => {
+            switchToManual(); 
+            setSelectedId(d.id);
+        })
+        .on("drag", (event, d) => {
+             if (activeTool !== 'select') return;
+             setManualPositions(prev => {
+                 const next = new Map(prev);
+                 next.set(d.id, { x: event.x, y: event.y });
+                 return next;
+             });
+        });
+
+      if (activeTool === 'select') {
+          svg.selectAll<SVGGElement, GraphNode>(".node").call(dragBehavior);
+      } else {
+          svg.selectAll<SVGGElement, GraphNode>(".node").on(".drag", null);
+      }
+  }, [nodes, activeTool]);
+
+  // Link Segment Handle Drag (X or Y depending on route type)
+  useEffect(() => {
+      if (!svgRef.current) return;
+      const svg = d3.select(svgRef.current);
+
+      const linkDrag = d3.drag<SVGCircleElement, {id: string, routeType: RouteType}>()
+        .filter(event => event.button === 0)
+        .on("start", () => switchToManual())
+        .on("drag", (event, d) => {
+            if (activeTool !== 'select') return;
+            
+            setLinkSegmentOffsets(prev => {
+                const next = new Map(prev);
+                // If it's a Vertical Stack (Bottom->Top), we adjust Y.
+                // If it's a Side Bracket (Left->Left), we adjust X.
+                const val = (d.routeType === 'SideBracket') ? event.x : event.y;
+                next.set(d.id, val);
+                return next;
+            });
+        });
+
+      svg.selectAll<SVGCircleElement, any>(".link-handle").call(linkDrag);
+  }, [routes, activeTool]);
+
+  // Main Render
+  useEffect(() => {
+    if (!svgRef.current) return;
+    const svg = d3.select(svgRef.current);
+    const g = svg.select<SVGGElement>("g.main-group");
+
+    // Drawing Line
+    svg.on("mousemove", (event) => {
+           if (activeTool === 'edge' && drawSourceId) {
+               const transform = d3.zoomTransform(svg.node()!);
+               const [mx, my] = d3.pointer(event, svg.node());
+               const x = (mx - transform.x) / transform.k;
+               const y = (my - transform.y) / transform.k;
+               setMousePos({x, y});
+           }
+       });
+
+    g.selectAll(".temp-line").remove();
+    if (activeTool === 'edge' && drawSourceId && mousePos) {
+        const sourceNode = nodes.find(n => n.id === drawSourceId);
+        if (sourceNode) {
+            g.append("line")
+             .attr("class", "temp-line")
+             .attr("x1", sourceNode.x).attr("y1", sourceNode.y)
+             .attr("x2", mousePos.x).attr("y2", mousePos.y)
+             .attr("stroke", "#ef4444").attr("stroke-width", 2).attr("stroke-dasharray", "4 4");
+        }
+    }
+
+    // Defs
+    const defs = svg.select("defs");
+    if (defs.empty()) {
+        const newDefs = svg.append("defs");
+        newDefs.append("marker").attr("id", "arrow-filled").attr("viewBox", "0 -5 10 10")
+        .attr("refX", 8).attr("refY", 0).attr("markerWidth", 6).attr("markerHeight", 6)
+        .attr("orient", "auto").append("path").attr("d", "M0,-5L10,0L0,5").attr("fill", "#333");
+
+        newDefs.append("marker").attr("id", "arrow-selected").attr("viewBox", "0 -5 10 10")
+        .attr("refX", 8).attr("refY", 0).attr("markerWidth", 6).attr("markerHeight", 6)
+        .attr("orient", "auto").append("path").attr("d", "M0,-5L10,0L0,5").attr("fill", "#3b82f6");
+    }
 
     // --- Links ---
-    g.append("g")
-      .attr("class", "links")
-      .selectAll("path")
+    g.selectAll(".links").remove();
+    const linkGroup = g.append("g").attr("class", "links");
+    
+    const linksSelection = linkGroup.selectAll("g.link-group")
       .data(links)
-      .join("path")
-      .attr("d", (d, i) => pathStrings[i])
+      .join("g")
+      .attr("class", "link-group");
+
+    // Hit Area
+    linksSelection.append("path")
+      .attr("d", (d, i) => routes[i].path)
+      .attr("stroke", "transparent").attr("stroke-width", 15).attr("fill", "none")
+      .on("click", (e, d) => {
+          e.stopPropagation();
+          if (d.id) handleLinkClick(d.id);
+      });
+
+    // Visible Path
+    linksSelection.append("path")
+      .attr("class", "visible-path")
+      .attr("d", (d, i) => routes[i].path) 
       .attr("fill", "none")
-      .attr("stroke", "#000")
-      .attr("stroke-width", 1.2)
-      .attr("marker-end", "url(#arrow-filled)");
+      .attr("stroke", (d) => d.id === selectedId ? "#3b82f6" : "#333") 
+      .attr("stroke-width", (d) => d.id === selectedId ? 2.5 : 1.5)
+      .attr("marker-end", (d) => d.id === selectedId ? "url(#arrow-selected)" : "url(#arrow-filled)")
+      .style("pointer-events", "none");
+
+    // --- Port Controls (Only for Selected Link) ---
+    g.selectAll(".port-controls").remove();
+    const selectedLink = links.find(l => l.id === selectedId);
+    if (activeTool === 'select' && selectedLink && selectedId) {
+        const portsGroup = g.append("g").attr("class", "port-controls");
+        
+        // Helper to draw 4 dots around a node
+        const drawNodePorts = (node: GraphNode, type: 'source' | 'target') => {
+            const isLayer = node.type === UnitType.LAYER;
+            const w = isLayer ? 36 : 60;
+            const h = isLayer ? 36 : 28;
+            const cx = node.x;
+            const cy = node.y;
+
+            const config = linkPorts.get(selectedId!) || {};
+            const activeSide = type === 'source' ? config.sourceSide : config.targetSide;
+            
+            const positions: {side: Side, x: number, y: number}[] = [
+                { side: 'top', x: cx, y: cy - h/2 - 8 },
+                { side: 'bottom', x: cx, y: cy + h/2 + 8 },
+                { side: 'left', x: cx - w/2 - 8, y: cy },
+                { side: 'right', x: cx + w/2 + 8, y: cy },
+            ];
+
+            positions.forEach(p => {
+                const isActive = activeSide ? activeSide === p.side : (type === 'source' ? p.side === 'bottom' : p.side === 'top'); 
+                
+                portsGroup.append("circle")
+                    .attr("class", "port-control")
+                    .attr("cx", p.x).attr("cy", p.y).attr("r", 4)
+                    .attr("fill", isActive ? "#ef4444" : "#fff")
+                    .attr("stroke", "#ef4444").attr("stroke-width", 1)
+                    .style("cursor", "pointer")
+                    .on("click", (e) => {
+                        e.stopPropagation();
+                        updateLinkPort(selectedId!, type, p.side);
+                    })
+                    .append("title").text(`Set ${type} to ${p.side}`);
+            });
+        };
+
+        drawNodePorts(selectedLink.source, 'source');
+        drawNodePorts(selectedLink.target, 'target');
+    }
+
+    // --- Link Control Handles (General) ---
+    // These allow dragging the middle segment of the line (X or Y)
+    g.selectAll(".link-handles").remove();
+    if (layoutMode === 'manual' && activeTool === 'select') {
+        const handleGroup = g.append("g").attr("class", "link-handles");
+        const handleData = links.map((link, i) => {
+            const route = routes[i];
+            // Determine handle position based on route type
+            let hx = 0;
+            let hy = 0;
+            if (route.routeType === 'VerticalStack') {
+                // Control is Y
+                hx = (link.source.x + link.target.x) / 2;
+                hy = route.controlPoint;
+            } else if (route.routeType === 'SideBracket') {
+                // Control is X
+                hx = route.controlPoint;
+                hy = (link.source.y + link.target.y) / 2;
+            } else {
+                return null; // Mixed types might not have a simple single-axis drag
+            }
+
+            return {
+                id: link.id,
+                x: hx,
+                y: hy,
+                routeType: route.routeType,
+                isSelected: link.id === selectedId
+            };
+        }).filter(h => h !== null) as {id: string, x: number, y: number, routeType: RouteType, isSelected: boolean}[];
+
+        handleGroup.selectAll("circle")
+            .data(handleData)
+            .join("circle")
+            .attr("class", "link-handle")
+            .attr("cx", d => d.x).attr("cy", d => d.y)
+            .attr("r", d => d.isSelected ? 6 : 4) 
+            .attr("fill", "#fbbf24").attr("stroke", "#fff").attr("stroke-width", 1)
+            .style("cursor", d => d.routeType === 'SideBracket' ? "ew-resize" : "ns-resize")
+            .style("opacity", d => (d.isSelected || layoutMode === 'manual') ? 1 : 0)
+            .append("title").text(d => d.routeType === 'SideBracket' ? "拖动调整水平位置" : "拖动调整垂直位置");
+    }
 
     // --- Nodes ---
-    const nodeGroup = g.append("g")
-      .attr("class", "nodes")
-      .selectAll("g")
-      .data(nodes)
-      .join("g")
+    g.selectAll(".nodes").remove();
+    const nodeGroup = g.append("g").attr("class", "nodes")
+      .selectAll("g").data(nodes).join("g")
       .attr("transform", d => `translate(${d.x},${d.y})`)
-      .attr("class", "node cursor-pointer")
+      .attr("class", d => `node`)
+      .style("cursor", () => {
+          if (activeTool === 'select') return 'move';
+          if (activeTool === 'edge') return 'crosshair';
+          if (activeTool === 'eraser') return 'not-allowed';
+          return 'pointer';
+      })
       .on("click", (event, d) => {
-          onNodeClick(d);
+          event.stopPropagation();
+          handleNodeInteraction(d, event);
       });
 
     nodeGroup.each(function(d) {
       const node = d3.select(this);
       const isLayer = d.type === 'LAYER';
-      
-      if (isLayer) {
-        node.append("circle")
-          .attr("r", 18) 
-          .attr("fill", "#fff")
-          .attr("stroke", "none"); 
-        
-        node.append("text")
-          .attr("text-anchor", "middle")
-          .attr("dy", 6)
-          .attr("fill", "#000")
-          .attr("font-family", "serif") 
-          .attr("font-size", "22px") 
-          .attr("font-weight", "bold")
-          .text(toCircled(d.id));
-      } else {
-        const w = 60;
-        const h = 28;
-        node.append("rect")
-          .attr("x", -w/2)
-          .attr("y", -h/2)
-          .attr("width", w)
-          .attr("height", h)
-          .attr("fill", "#fff")
-          .attr("stroke", "#000")
-          .attr("stroke-width", 1.2);
+      const isSelected = selectedId === d.id;
+      const isSource = drawSourceId === d.id;
+      const strokeColor = isSelected || isSource ? "#3b82f6" : "#000";
+      const strokeWidth = isSelected || isSource ? 2.5 : 1.2;
+      const fill = "#fff";
 
-        node.append("text")
-          .attr("text-anchor", "middle")
-          .attr("dy", 4)
-          .attr("fill", "#000")
-          .attr("font-size", "14px")
-          .attr("font-family", "sans-serif")
-          .text(d.id);
+      if (isLayer) {
+        node.append("circle").attr("r", 18).attr("fill", fill).attr("stroke", strokeColor).attr("stroke-width", isLayer && !isSelected ? 0 : strokeWidth);
+        node.append("text").attr("text-anchor", "middle").attr("dy", 6).attr("fill", "#000").attr("font-family", "serif").attr("font-size", "22px").attr("font-weight", "bold").style("pointer-events", "none").text(toCircled(d.id));
+      } else {
+        const w = 60; const h = 28;
+        node.append("rect").attr("x", -w/2).attr("y", -h/2).attr("width", w).attr("height", h).attr("fill", fill).attr("stroke", strokeColor).attr("stroke-width", strokeWidth);
+        node.append("text").attr("text-anchor", "middle").attr("dy", 4).attr("fill", "#000").attr("font-size", "14px").attr("font-family", "sans-serif").style("pointer-events", "none").text(d.id);
+      }
+      
+      if (isSelected) {
+          node.append("circle").attr("r", 4).attr("cx", isLayer ? 18 : 30).attr("cy", 0).attr("fill", "#3b82f6");
       }
     });
-    
-    // Add tooltip-like hint on hover (optional)
-    nodeGroup.append("title").text(d => `点击编辑 ${d.id}`);
 
-  }, [nodes, links, layers, pathStrings, onNodeClick]);
+  }, [nodes, links, routes, layoutMode, activeTool, drawSourceId, mousePos, selectedId, linkPorts]);
 
   const handleExport = () => {
     if (!svgRef.current) return;
@@ -317,32 +571,126 @@ const MatrixCanvas: React.FC<MatrixCanvasProps> = ({ units, relations, onNodeCli
   };
 
   return (
-    <div ref={containerRef} className="w-full h-full bg-white border border-gray-300 rounded-lg overflow-hidden shadow-inner relative">
-      <div className="absolute top-4 right-4 z-10">
+    <div 
+        ref={containerRef} 
+        className={`w-full h-full bg-white border border-gray-300 rounded-lg overflow-hidden shadow-inner relative group ${activeTool === 'node' ? 'cursor-crosshair' : ''}`}
+        onClick={handleCanvasClick}
+        onContextMenu={(e) => e.preventDefault()} 
+    >
+
+      {/* Visio-like Toolbar */}
+      <div className="absolute top-4 right-4 z-20 flex flex-col gap-2 pointer-events-auto items-end">
+         
+         <div className="bg-white border border-gray-300 rounded shadow-sm flex flex-col overflow-hidden mb-2">
+             <button
+                onClick={() => {
+                    setLayoutMode('auto');
+                    setManualPositions(new Map());
+                    setLinkSegmentOffsets(new Map());
+                    setLinkPorts(new Map());
+                    setActiveTool('select');
+                    handleResetZoom();
+                }}
+                className={`p-2 text-xs font-medium flex items-center justify-center gap-2 hover:bg-gray-50 ${layoutMode === 'auto' ? 'bg-amber-50 text-amber-700' : 'text-gray-500'}`}
+                title="自动布局 (重置)"
+             >
+                 <Lock size={16}/> 
+             </button>
+             <button
+                onClick={switchToManual}
+                className={`p-2 text-xs font-medium flex items-center justify-center gap-2 hover:bg-gray-50 ${layoutMode === 'manual' ? 'bg-amber-50 text-amber-700' : 'text-gray-500'}`}
+                title="手动/绘图模式"
+             >
+                 <Unlock size={16}/>
+             </button>
+         </div>
+
+         {/* Zoom Controls */}
+         <div className="bg-white border border-gray-300 rounded shadow-sm flex flex-col overflow-hidden mb-2">
+             <button onClick={handleZoomIn} className="p-2 text-gray-600 hover:bg-gray-50" title="放大">
+                 <ZoomIn size={16}/>
+             </button>
+             <button onClick={handleZoomOut} className="p-2 text-gray-600 hover:bg-gray-50" title="缩小">
+                 <ZoomOut size={16}/>
+             </button>
+             <button onClick={handleResetZoom} className="p-2 text-gray-600 hover:bg-gray-50" title="适应窗口">
+                 <Maximize size={16}/>
+             </button>
+         </div>
+
+         <div className="bg-white border border-gray-300 rounded-lg shadow-md flex flex-col overflow-hidden divide-y divide-gray-100">
+             <button
+                onClick={() => handleToolChange('select')}
+                className={`p-3 hover:bg-gray-50 transition-colors relative group ${activeTool === 'select' ? 'bg-blue-100 text-blue-700' : 'text-gray-600'}`}
+                title="选择 (V)"
+             >
+                 <MousePointer2 size={18}/>
+             </button>
+             
+             <button
+                onClick={() => handleToolChange('node')}
+                className={`p-3 hover:bg-gray-50 transition-colors relative group ${activeTool === 'node' ? 'bg-blue-100 text-blue-700' : 'text-gray-600'}`}
+                title="绘制遗迹 (B)"
+             >
+                 <Square size={18}/>
+             </button>
+
+             <button
+                onClick={() => handleToolChange('edge')}
+                className={`p-3 hover:bg-gray-50 transition-colors relative group ${activeTool === 'edge' ? 'bg-blue-100 text-blue-700' : 'text-gray-600'}`}
+                title="绘制连线 (L)"
+             >
+                 <PenTool size={18}/>
+             </button>
+
+             <button
+                onClick={() => handleToolChange('eraser')}
+                className={`p-3 hover:bg-red-50 transition-colors relative group ${activeTool === 'eraser' ? 'bg-red-100 text-red-600' : 'text-gray-600'}`}
+                title="删除工具 (D)"
+             >
+                 <Eraser size={18}/>
+             </button>
+         </div>
+         
          <button 
            onClick={handleExport}
-           className="bg-white hover:bg-gray-50 text-gray-800 border border-gray-300 px-3 py-1.5 rounded shadow text-xs font-medium flex items-center gap-2 transition-colors"
+           className="mt-2 bg-white hover:bg-gray-50 text-gray-800 border border-gray-300 p-2 rounded-full shadow-sm flex items-center justify-center transition-colors"
+           title="导出"
          >
-           <Download size={14} /> 导出高清图片
+           <Download size={18} /> 
          </button>
       </div>
-      
+
+      {/* Info Overlay */}
       <div className="absolute top-4 left-4 z-10 bg-white/90 p-2 rounded border border-gray-200 text-xs text-gray-800 pointer-events-none shadow-sm">
-        <div className="flex items-center gap-2 mb-1">
-          <div className="font-serif font-bold text-base">①a</div>
-          <span>地层</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="w-4 h-3 border border-black bg-white"></div>
-          <span>遗迹</span>
-        </div>
-        <div className="mt-1 border-t pt-1 flex items-center gap-1 text-[10px] text-gray-500">
-             <span className="w-4 h-2 border-b border-black rounded-b-full"></span>
-             <span>过桥线</span>
-        </div>
+        {activeTool === 'node' && (
+            <div className="flex items-center gap-2 text-blue-600 font-bold">
+                 <Plus size={12}/> <span>点击画布绘制新遗迹 (自动编号)</span>
+             </div>
+        )}
+        {activeTool === 'edge' && (
+             <div className="flex items-center gap-2 text-blue-600 font-bold">
+                 <PenTool size={12}/>
+                 <span>{drawSourceId ? "点击目标单位结束连线" : "点击起点单位开始连线"}</span>
+             </div>
+        )}
+        {activeTool === 'eraser' && (
+             <div className="flex items-center gap-2 text-red-600 font-bold">
+                 <Eraser size={12}/> <span>点击遗迹或连线删除</span>
+             </div>
+        )}
+        {activeTool === 'select' && (
+            <div className="space-y-1">
+                <div className="flex items-center gap-2 text-gray-600">
+                    <MousePointer2 size={12}/> <span>选择 / 拖拽 / <b>中键平移</b></span>
+                </div>
+                {layoutMode === 'manual' && <div className="text-amber-600 flex items-center gap-1"><Move size={10}/> 拖拽黄点调整线高(上下)或线宽(左右)，红点改变接口</div>}
+                {selectedId && <div className="text-blue-600 font-bold">已选择: {selectedId} (按 Delete 删除)</div>}
+            </div>
+        )}
       </div>
       
-      <svg ref={svgRef} className="w-full h-full touch-action-none bg-white"></svg>
+      <svg ref={svgRef} className="w-full h-full touch-action-none bg-white cursor-default"></svg>
     </div>
   );
 };

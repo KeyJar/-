@@ -3,7 +3,7 @@ import MatrixCanvas from './components/MatrixCanvas';
 import UnitForm from './components/UnitForm';
 import ChatWidget from './components/ChatWidget';
 import EditUnitModal from './components/EditUnitModal';
-import { ArchaeologicalUnit, StratigraphicRelation, GraphOperation, RelationType } from './types';
+import { ArchaeologicalUnit, StratigraphicRelation, GraphOperation, RelationType, UnitType } from './types';
 
 const App: React.FC = () => {
   const [units, setUnits] = useState<ArchaeologicalUnit[]>([]);
@@ -20,8 +20,31 @@ const App: React.FC = () => {
   };
 
   const removeUnit = (id: string) => {
-    setUnits(prev => prev.filter(u => u.id !== id));
-    setRelations(prev => prev.filter(r => r.sourceId !== id && r.targetId !== id));
+    // Determine which IDs to remove (Target Unit + Potentially Empty Parent Layer)
+    const unitToDelete = units.find(u => u.id === id);
+    const idsToRemove = [id];
+
+    if (unitToDelete && unitToDelete.openingLayerId) {
+        const layerId = unitToDelete.openingLayerId;
+        
+        // Check if any *other* unit has this openingLayerId
+        const hasSiblings = units.some(u => u.id !== id && u.openingLayerId === layerId);
+        
+        if (!hasSiblings) {
+            // No siblings left, check if the layer unit exists and is actually a LAYER
+            const layerUnit = units.find(u => u.id === layerId);
+            if (layerUnit && layerUnit.type === UnitType.LAYER) {
+                idsToRemove.push(layerId);
+            }
+        }
+    }
+
+    setUnits(prev => prev.filter(u => !idsToRemove.includes(u.id)));
+    setRelations(prev => prev.filter(r => !idsToRemove.includes(r.sourceId) && !idsToRemove.includes(r.targetId)));
+
+    if (editingUnit && idsToRemove.includes(editingUnit.id)) {
+        setEditingUnit(null);
+    }
   };
 
   const addRelation = (relation: StratigraphicRelation) => {
@@ -117,6 +140,7 @@ const App: React.FC = () => {
           onRemoveUnit={removeUnit}
           onAddRelation={addRelation}
           onRemoveRelation={removeRelation}
+          onUpdateUnit={handleUpdateUnit}
           onBulkImport={handleBulkImport}
           onClearAll={handleClearAll}
         />
@@ -138,6 +162,10 @@ const App: React.FC = () => {
              units={units} 
              relations={relations} 
              onNodeClick={setEditingUnit}
+             onAddRelation={addRelation}
+             onAddUnit={addUnit}
+             onDeleteUnit={removeUnit}
+             onDeleteRelation={removeRelation}
            />
          )}
          
@@ -157,10 +185,13 @@ const App: React.FC = () => {
              <EditUnitModal 
                 unit={editingUnit}
                 allUnits={units}
+                relations={relations}
                 isOpen={!!editingUnit}
                 onClose={() => setEditingUnit(null)}
                 onSave={handleUpdateUnit}
                 onDelete={removeUnit}
+                onAddRelation={addRelation}
+                onRemoveRelation={removeRelation}
              />
          )}
       </main>
